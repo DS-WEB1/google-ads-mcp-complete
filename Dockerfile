@@ -10,6 +10,7 @@ RUN python -m venv /opt/venv
 ENV PATH="/opt/venv/bin:$PATH"
 
 RUN pip install --upgrade pip
+RUN pip install structlog
 RUN pip install -e .
 
 EXPOSE 8080
