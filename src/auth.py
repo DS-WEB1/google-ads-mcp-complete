@@ -145,6 +145,9 @@ class GoogleAdsAuthManager:
             login_customer_id = self.config.get("login_customer_id")
             if login_customer_id:
                 login_customer_id = str(login_customer_id).replace("-", "")
+            elif customer_id:
+                # Direct access: use the account being queried
+                login_customer_id = str(customer_id).replace("-", "")
 
             linked_customer_id = self.config.get("linked_customer_id")
             if linked_customer_id:
