@@ -8,11 +8,13 @@ COPY . .
 
 RUN python -m venv /opt/venv
 ENV PATH="/opt/venv/bin:$PATH"
+ENV PYTHONUNBUFFERED=1
 
-RUN pip install --upgrade pip
-RUN pip install structlog
-RUN pip install -e .
+RUN pip install --upgrade pip \
+ && pip install "mcp>=1.0.0,<2.0.0" \
+ && pip install -e . \
+ && pip install mcp-proxy
 
 EXPOSE 8080
 
-CMD ["python", "-m", "src"]
+CMD ["mcp-proxy", "--host", "0.0.0.0", "--port", "8080", "--", "python", "-m", "src"]
