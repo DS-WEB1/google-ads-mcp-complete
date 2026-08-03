@@ -126,22 +126,12 @@ class GoogleAdsAuthManager:
             raise AuthenticationError(f"Failed to load service account: {e}")
             
     def get_client(self, customer_id: Optional[str] = None) -> GoogleAdsClient:
-        """Get an authenticated Google Ads client.
-        
-        Args:
-            customer_id: Optional customer ID to use. Defaults to login_customer_id.
-            
-        Returns:
-            Authenticated GoogleAdsClient instance.
-        """
-        # Check cache
         cache_key = customer_id or "default"
         if cached_client := self._client_cache.get(cache_key):
             return cached_client
-            
-        # Determine auth method
+
         use_service_account = bool(self.config.get("service_account_path"))
-        
+
         try:
             if use_service_account:
                 credentials = self._get_service_account_credentials()
@@ -149,46 +139,42 @@ class GoogleAdsAuthManager:
             else:
                 credentials = self._get_oauth_credentials()
                 logger.info("Using OAuth2 authentication")
-                
-            # Build configuration for GoogleAdsClient
-            client_config = {
-                "developer_token": self.config["developer_token"],
-                "use_proto_plus": self.config.get("use_proto_plus", True),
-            }
-            
-            # Add customer IDs
-            if customer_id:
-                client_config["login_customer_id"] = customer_id.replace("-", "")
-            elif login_customer_id := self.config.get("login_customer_id"):
-                client_config["login_customer_id"] = login_customer_id.replace("-", "")
-                
-            if linked_customer_id := self.config.get("linked_customer_id"):
-                client_config["linked_customer_id"] = linked_customer_id.replace("-", "")
-                
-            # Create client
+
+            # Always use the MCC/manager from config as login-customer-id.
+            # Never overwrite it with the client customer_id being queried.
+            login_customer_id = self.config.get("login_customer_id")
+            if login_customer_id:
+                login_customer_id = str(login_customer_id).replace("-", "")
+
+            linked_customer_id = self.config.get("linked_customer_id")
+            if linked_customer_id:
+                linked_customer_id = str(linked_customer_id).replace("-", "")
+
+            use_proto_plus = self.config.get("use_proto_plus", True)
+            if isinstance(use_proto_plus, str):
+                use_proto_plus = use_proto_plus.strip().lower() in ("1", "true", "yes")
+    
             client = GoogleAdsClient(
                 credentials=credentials,
-                developer_token=client_config["developer_token"],
-                login_customer_id=client_config.get("login_customer_id"),
-                linked_customer_id=client_config.get("linked_customer_id"),
-                use_proto_plus=client_config["use_proto_plus"],
+                developer_token=self.config["developer_token"],
+                login_customer_id=login_customer_id,
+                linked_customer_id=linked_customer_id,
+                use_proto_plus=use_proto_plus,
             )
-            
-            # Cache the client
+    
             self._client_cache[cache_key] = client
-            
             logger.info(
                 "Google Ads client created successfully",
                 customer_id=customer_id,
+                login_customer_id=login_customer_id,
                 auth_method="service_account" if use_service_account else "oauth2",
             )
-            
             return client
-            
+    
         except Exception as e:
             logger.error(f"Failed to create Google Ads client: {e}")
-            raise AuthenticationError(f"Failed to create client: {e}")
-            
+            raise AuthenticationError(f"Failed to create client: {e}") 
+        
     def validate_credentials(self, customer_id: Optional[str] = None) -> bool:
         """Validate that credentials work by making a simple API call.
         
