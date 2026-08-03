@@ -17,4 +17,4 @@ RUN pip install --upgrade pip \
 
 EXPOSE 8080
 
-CMD ["mcp-proxy", "--host", "0.0.0.0", "--port", "8080", "--", "python", "-m", "src"]
+CMD ["mcp-proxy", "--pass-environment", "--host", "0.0.0.0", "--port", "8080", "--", "python", "-m", "src"]
