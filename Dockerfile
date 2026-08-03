@@ -14,4 +14,5 @@ RUN pip install -e .
 
 EXPOSE 8080
 
-CMD ["python", "-m", "src"]
+CMD ["bash", "-lc", "cd /app && python -m src"]
+
