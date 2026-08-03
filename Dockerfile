@@ -14,4 +14,4 @@ RUN pip install -e .
 
 EXPOSE 8080
 
-CMD ["python", "/app/src/server.py"]
+CMD ["python", "-m", "src"]
