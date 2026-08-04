@@ -7,6 +7,11 @@ from google.ads.googleads.client import GoogleAdsClient
 from google.ads.googleads.errors import GoogleAdsException
 
 from .utils import currency_to_micros, micros_to_currency
+from .validation import (
+    validate_customer_id,
+    validate_numeric_id,
+    ValidationError,
+)
 
 logger = structlog.get_logger(__name__)
 
@@ -27,6 +32,7 @@ class BudgetTools:
     ) -> Dict[str, Any]:
         """Create a shared campaign budget."""
         try:
+            customer_id = validate_customer_id(customer_id)
             client = self.auth_manager.get_client(customer_id)
             budget_service = client.get_service("CampaignBudgetService")
             
@@ -37,6 +43,7 @@ class BudgetTools:
             # Set budget properties
             budget.name = name
             budget.amount_micros = amount_micros
+            budget.explicitly_shared = False
             
             # Set delivery method
             if delivery_method.upper() == "ACCELERATED":
@@ -78,6 +85,8 @@ class BudgetTools:
                 "error": str(e),
                 "error_type": "GoogleAdsException"
             }
+        except ValidationError:
+            raise
         except Exception as e:
             logger.error(f"Unexpected error creating budget: {e}")
             return {
@@ -95,6 +104,8 @@ class BudgetTools:
     ) -> Dict[str, Any]:
         """Update budget amount or settings."""
         try:
+            customer_id = validate_customer_id(customer_id)
+            budget_id = validate_numeric_id(budget_id, "budget_id")
             client = self.auth_manager.get_client(customer_id)
             budget_service = client.get_service("CampaignBudgetService")
             
@@ -150,6 +161,8 @@ class BudgetTools:
                 "error": str(e),
                 "error_type": "GoogleAdsException"
             }
+        except ValidationError:
+            raise
         except Exception as e:
             logger.error(f"Unexpected error updating budget: {e}")
             return {
@@ -158,12 +171,51 @@ class BudgetTools:
                 "error_type": "UnexpectedError"
             }
     
+    async def remove_budget(
+        self,
+        customer_id: str,
+        budget_id: str,
+    ) -> Dict[str, Any]:
+        """Remove (delete) a campaign budget."""
+        try:
+            customer_id = validate_customer_id(customer_id)
+            budget_id = validate_numeric_id(budget_id, "budget_id")
+            client = self.auth_manager.get_client(customer_id)
+            budget_service = client.get_service("CampaignBudgetService")
+
+            budget_operation = client.get_type("CampaignBudgetOperation")
+            budget_operation.remove = budget_service.campaign_budget_path(
+                customer_id, budget_id
+            )
+
+            response = budget_service.mutate_campaign_budgets(
+                customer_id=customer_id,
+                operations=[budget_operation],
+            )
+
+            logger.info("Removed campaign budget", customer_id=customer_id, budget_id=budget_id)
+            return {
+                "success": True,
+                "budget_id": budget_id,
+                "message": f"Successfully removed budget {budget_id}",
+            }
+
+        except GoogleAdsException as e:
+            logger.error(f"Failed to remove budget: {e}")
+            return {"success": False, "error": str(e), "error_type": "GoogleAdsException"}
+        except ValidationError:
+            raise
+        except Exception as e:
+            logger.error(f"Unexpected error removing budget: {e}")
+            return {"success": False, "error": str(e), "error_type": "UnexpectedError"}
+
     async def list_budgets(
         self,
         customer_id: str
     ) -> Dict[str, Any]:
         """List all budgets."""
         try:
+            customer_id = validate_customer_id(customer_id)
             client = self.auth_manager.get_client(customer_id)
             googleads_service = client.get_service("GoogleAdsService")
             
@@ -205,6 +257,8 @@ class BudgetTools:
                 "error": str(e),
                 "error_type": "GoogleAdsException"
             }
+        except ValidationError:
+            raise
         except Exception as e:
             logger.error(f"Unexpected error listing budgets: {e}")
             return {

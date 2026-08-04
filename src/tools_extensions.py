@@ -6,6 +6,11 @@ import structlog
 from google.ads.googleads.client import GoogleAdsClient
 from google.ads.googleads.errors import GoogleAdsException
 
+from .validation import (
+    validate_customer_id, validate_numeric_id, validate_enum,
+    EXTENSION_TYPES, ValidationError,
+)
+
 logger = structlog.get_logger(__name__)
 
 
@@ -23,13 +28,15 @@ class ExtensionTools:
         sitelinks: List[Dict[str, str]]
     ) -> Dict[str, Any]:
         """Create sitelink extensions for a campaign.
-        
+
         Args:
             customer_id: The customer ID
             campaign_id: The campaign ID
             sitelinks: List of sitelinks with 'text', 'url' and optional 'description1', 'description2'
         """
         try:
+            customer_id = validate_customer_id(customer_id)
+            campaign_id = validate_numeric_id(campaign_id, "campaign_id")
             client = self.auth_manager.get_client(customer_id)
             asset_service = client.get_service("AssetService")
             campaign_asset_service = client.get_service("CampaignAssetService")
@@ -111,13 +118,15 @@ class ExtensionTools:
         callouts: List[str]
     ) -> Dict[str, Any]:
         """Create callout extensions for a campaign.
-        
+
         Args:
             customer_id: The customer ID
-            campaign_id: The campaign ID  
+            campaign_id: The campaign ID
             callouts: List of callout text strings
         """
         try:
+            customer_id = validate_customer_id(customer_id)
+            campaign_id = validate_numeric_id(campaign_id, "campaign_id")
             client = self.auth_manager.get_client(customer_id)
             asset_service = client.get_service("AssetService")
             campaign_asset_service = client.get_service("CampaignAssetService")
@@ -192,7 +201,7 @@ class ExtensionTools:
         structured_snippets: List[Dict[str, Any]]
     ) -> Dict[str, Any]:
         """Create structured snippet extensions for a campaign.
-        
+
         Args:
             customer_id: The customer ID
             campaign_id: The campaign ID
@@ -200,6 +209,8 @@ class ExtensionTools:
                 Example: [{"header": "Services", "values": ["Web Design", "SEO", "PPC"]}]
         """
         try:
+            customer_id = validate_customer_id(customer_id)
+            campaign_id = validate_numeric_id(campaign_id, "campaign_id")
             client = self.auth_manager.get_client(customer_id)
             asset_service = client.get_service("AssetService")
             campaign_asset_service = client.get_service("CampaignAssetService")
@@ -338,8 +349,8 @@ class ExtensionTools:
         country_code: str = "US",
         call_only: bool = False
     ) -> Dict[str, Any]:
-        """Create call extensions for a campaign.
-        
+        """Create call extensions for a campaign using AssetService (v21).
+
         Args:
             customer_id: The customer ID
             campaign_id: The campaign ID
@@ -348,43 +359,57 @@ class ExtensionTools:
             call_only: Whether this is call-only (default: False)
         """
         try:
+            customer_id = validate_customer_id(customer_id)
+            campaign_id = validate_numeric_id(campaign_id, "campaign_id")
             client = self.auth_manager.get_client(customer_id)
-            extension_feed_item_service = client.get_service("ExtensionFeedItemService")
-            
-            # Create call extension
-            extension_feed_item_operation = client.get_type("ExtensionFeedItemOperation")
-            extension_feed_item = extension_feed_item_operation.create
-            
-            # Set extension type
-            extension_feed_item.extension_type = client.enums.ExtensionTypeEnum.CALL
-            
-            # Set call feed item
-            call_feed_item = extension_feed_item.call_feed_item
-            call_feed_item.phone_number = phone_number
-            call_feed_item.country_code = country_code
-            call_feed_item.call_tracking_enabled = True
-            call_feed_item.call_conversion_action = ""  # Can be set if conversion tracking is needed
-            call_feed_item.call_conversion_tracking_disabled = False
-            
-            # Set targeted campaign
-            extension_feed_item.targeted_campaign = client.get_service("CampaignService").campaign_path(
+            asset_service = client.get_service("AssetService")
+            campaign_asset_service = client.get_service("CampaignAssetService")
+
+            # Step 1: Create call asset
+            asset_operation = client.get_type("AssetOperation")
+            asset = asset_operation.create
+            asset.name = f"Call: {phone_number}"
+
+            call_asset = client.get_type("CallAsset")
+            call_asset.phone_number = phone_number
+            call_asset.country_code = country_code
+            call_asset.call_conversion_reporting_state = (
+                client.enums.CallConversionReportingStateEnum.USE_ACCOUNT_LEVEL_CALL_CONVERSION_ACTION
+            )
+
+            asset.call_asset = call_asset
+            asset.type_ = client.enums.AssetTypeEnum.CALL
+
+            asset_response = asset_service.mutate_assets(
+                customer_id=customer_id,
+                operations=[asset_operation]
+            )
+
+            asset_resource_name = asset_response.results[0].resource_name
+
+            # Step 2: Link asset to campaign
+            campaign_asset_operation = client.get_type("CampaignAssetOperation")
+            campaign_asset = campaign_asset_operation.create
+            campaign_asset.campaign = client.get_service("CampaignService").campaign_path(
                 customer_id, campaign_id
             )
-            
-            # Execute operation
-            response = extension_feed_item_service.mutate_extension_feed_items(
+            campaign_asset.asset = asset_resource_name
+            campaign_asset.field_type = client.enums.AssetFieldTypeEnum.CALL
+
+            campaign_asset_service.mutate_campaign_assets(
                 customer_id=customer_id,
-                operations=[extension_feed_item_operation]
+                operations=[campaign_asset_operation]
             )
-            
+
             return {
                 "success": True,
                 "campaign_id": campaign_id,
                 "phone_number": phone_number,
                 "country_code": country_code,
-                "resource_name": response.results[0].resource_name,
+                "asset_resource_name": asset_resource_name,
+                "asset_id": asset_resource_name.split("/")[-1],
             }
-            
+
         except GoogleAdsException as e:
             logger.error(f"Failed to create call extension: {e}")
             raise
@@ -395,82 +420,107 @@ class ExtensionTools:
         campaign_id: Optional[str] = None,
         extension_type: Optional[str] = None
     ) -> Dict[str, Any]:
-        """List extensions for a campaign or account.
-        
+        """List extensions for a campaign or account using AssetService (v21+).
+
         Args:
             customer_id: The customer ID
             campaign_id: Optional campaign ID to filter by
             extension_type: Optional extension type (SITELINK, CALLOUT, CALL, etc.)
         """
         try:
+            customer_id = validate_customer_id(customer_id)
+            if campaign_id:
+                campaign_id = validate_numeric_id(campaign_id, "campaign_id")
+            if extension_type:
+                extension_type = validate_enum(extension_type, EXTENSION_TYPES, "extension_type")
             client = self.auth_manager.get_client(customer_id)
             googleads_service = client.get_service("GoogleAdsService")
-            
+
+            # Map extension types to campaign_asset field_type values
+            type_to_field_type = {
+                "SITELINK": "SITELINK",
+                "CALLOUT": "CALLOUT",
+                "CALL": "CALL",
+                "STRUCTURED_SNIPPET": "STRUCTURED_SNIPPET",
+            }
+
             query = """
                 SELECT
-                    extension_feed_item.resource_name,
-                    extension_feed_item.id,
-                    extension_feed_item.extension_type,
-                    extension_feed_item.status,
-                    extension_feed_item.sitelink_feed_item.link_text,
-                    extension_feed_item.sitelink_feed_item.line1,
-                    extension_feed_item.sitelink_feed_item.line2,
-                    extension_feed_item.callout_feed_item.callout_text,
-                    extension_feed_item.call_feed_item.phone_number,
-                    extension_feed_item.call_feed_item.country_code,
-                    extension_feed_item.final_urls,
+                    campaign_asset.resource_name,
+                    campaign_asset.status,
+                    campaign_asset.field_type,
+                    asset.id,
+                    asset.name,
+                    asset.type,
+                    asset.sitelink_asset.link_text,
+                    asset.sitelink_asset.description1,
+                    asset.sitelink_asset.description2,
+                    asset.final_urls,
+                    asset.callout_asset.callout_text,
+                    asset.call_asset.phone_number,
+                    asset.call_asset.country_code,
+                    asset.structured_snippet_asset.header,
+                    asset.structured_snippet_asset.values,
                     campaign.name,
                     campaign.id
-                FROM extension_feed_item
+                FROM campaign_asset
             """
-            
+
             conditions = []
             if campaign_id:
                 conditions.append(f"campaign.id = {campaign_id}")
-            if extension_type:
-                conditions.append(f"extension_feed_item.extension_type = '{extension_type.upper()}'")
-            
+            if extension_type and extension_type in type_to_field_type:
+                conditions.append(
+                    f"campaign_asset.field_type = '{type_to_field_type[extension_type]}'"
+                )
+
             if conditions:
                 query += " WHERE " + " AND ".join(conditions)
-            
-            query += " ORDER BY extension_feed_item.extension_type, extension_feed_item.id"
-            
+
+            query += " ORDER BY campaign_asset.field_type"
+
             response = googleads_service.search(
                 customer_id=customer_id,
                 query=query
             )
-            
+
             extensions = []
             for row in response:
+                field_type = str(row.campaign_asset.field_type.name)
                 extension_data = {
-                    "id": str(row.extension_feed_item.id),
-                    "type": str(row.extension_feed_item.extension_type.name),
-                    "status": str(row.extension_feed_item.status.name),
+                    "id": str(row.asset.id),
+                    "type": field_type,
+                    "status": str(row.campaign_asset.status.name),
                     "campaign_name": str(row.campaign.name),
                     "campaign_id": str(row.campaign.id),
-                    "resource_name": row.extension_feed_item.resource_name,
+                    "resource_name": row.campaign_asset.resource_name,
                 }
-                
+
                 # Add type-specific data
-                if row.extension_feed_item.extension_type.name == "SITELINK":
+                if field_type == "SITELINK":
                     extension_data["sitelink"] = {
-                        "link_text": str(row.extension_feed_item.sitelink_feed_item.link_text),
-                        "description1": str(row.extension_feed_item.sitelink_feed_item.line1),
-                        "description2": str(row.extension_feed_item.sitelink_feed_item.line2),
-                        "url": row.extension_feed_item.final_urls[0] if row.extension_feed_item.final_urls else "",
+                        "link_text": str(row.asset.sitelink_asset.link_text),
+                        "description1": str(row.asset.sitelink_asset.description1),
+                        "description2": str(row.asset.sitelink_asset.description2),
+                        "url": row.asset.final_urls[0] if row.asset.final_urls else "",
                     }
-                elif row.extension_feed_item.extension_type.name == "CALLOUT":
+                elif field_type == "CALLOUT":
                     extension_data["callout"] = {
-                        "text": str(row.extension_feed_item.callout_feed_item.callout_text),
+                        "text": str(row.asset.callout_asset.callout_text),
                     }
-                elif row.extension_feed_item.extension_type.name == "CALL":
+                elif field_type == "CALL":
                     extension_data["call"] = {
-                        "phone_number": str(row.extension_feed_item.call_feed_item.phone_number),
-                        "country_code": str(row.extension_feed_item.call_feed_item.country_code),
+                        "phone_number": str(row.asset.call_asset.phone_number),
+                        "country_code": str(row.asset.call_asset.country_code),
                     }
-                
+                elif field_type == "STRUCTURED_SNIPPET":
+                    extension_data["structured_snippet"] = {
+                        "header": str(row.asset.structured_snippet_asset.header),
+                        "values": list(row.asset.structured_snippet_asset.values),
+                    }
+
                 extensions.append(extension_data)
-            
+
             return {
                 "success": True,
                 "campaign_id": campaign_id,
@@ -478,7 +528,7 @@ class ExtensionTools:
                 "extensions": extensions,
                 "count": len(extensions),
             }
-            
+
         except GoogleAdsException as e:
             logger.error(f"Failed to list extensions: {e}")
             raise
@@ -489,12 +539,15 @@ class ExtensionTools:
         extension_id: str
     ) -> Dict[str, Any]:
         """Delete a specific extension.
-        
+
         Args:
             customer_id: The customer ID
             extension_id: The extension feed item resource name or ID
         """
         try:
+            customer_id = validate_customer_id(customer_id)
+            if not extension_id.startswith("customers/"):
+                extension_id = validate_numeric_id(extension_id, "extension_id")
             client = self.auth_manager.get_client(customer_id)
             extension_feed_item_service = client.get_service("ExtensionFeedItemService")
             

@@ -18,6 +18,7 @@ from .auth import GoogleAdsAuthManager, AuthenticationError
 from .error_handler import ErrorHandler, RetryableGoogleAdsClient
 from .tools_complete import GoogleAdsTools
 from .utils import format_currency, format_date_range, parse_date
+from .validation import ValidationError
 
 logger = structlog.get_logger(__name__)
 
@@ -71,11 +72,22 @@ class GoogleAdsMCPServer:
                     
                 return [TextContent(type="text", text=content)]
                 
+            except ValidationError as e:
+                logger.warning("Tool validation failed", tool=name, error=str(e))
+                return [TextContent(
+                    type="text",
+                    text=json.dumps({
+                        "success": False,
+                        "error": str(e),
+                        "error_type": "ValidationError",
+                        "tool": name,
+                    }, indent=2),
+                )]
             except Exception as e:
-                logger.error(f"Tool execution failed: {e}", tool=name, arguments=arguments)
+                logger.error("Tool execution failed", tool=name, exc_info=True)
                 error_response = {
                     "success": False,
-                    "error": str(e),
+                    "error": f"Tool execution failed: {type(e).__name__}",
                     "tool": name,
                 }
                 
@@ -83,10 +95,15 @@ class GoogleAdsMCPServer:
                 if hasattr(e, "__class__") and e.__class__.__name__ == "GoogleAdsException":
                     try:
                         error_details = self.error_handler.format_error_response(e)
-                        error_response.update(error_details)
-                    except Exception as format_error:
-                        logger.warning(f"Failed to format Google Ads error: {format_error}")
-                        error_response["ads_error"] = str(e)
+                        error_response["error_details"] = error_details.get("errors", [])
+                        error_response["error_code"] = error_details.get("error_code", "UNKNOWN")
+                        error_response["request_id"] = error_details.get("request_id")
+                        # Include the first error message for quick diagnosis
+                        if error_details.get("errors"):
+                            first_err = error_details["errors"][0]
+                            error_response["error"] = f"{first_err.get('type', 'UNKNOWN')}: {first_err.get('message', str(e))}"
+                    except Exception:
+                        logger.warning("Failed to format Google Ads error", exc_info=True)
                     
                 return [TextContent(type="text", text=json.dumps(error_response, indent=2, default=str))]
                 
@@ -105,7 +122,7 @@ class GoogleAdsMCPServer:
                 customers = self.auth_manager.get_accessible_customers()
                 for customer in customers:
                     resources.append(f"googleads://customers/{customer['id']}")
-            except:
+            except Exception:
                 pass
                 
             return resources
@@ -406,6 +423,7 @@ async def main():
     """Main entry point."""
     # Look for config in standard locations
     config_paths = [
+        Path("config.json"),
         Path.home() / ".config" / "google-ads-mcp" / "config.json",
         Path.home() / ".google-ads-mcp.json",
         Path("google-ads-config.json"),

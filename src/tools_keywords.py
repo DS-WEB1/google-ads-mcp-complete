@@ -7,6 +7,12 @@ from google.ads.googleads.client import GoogleAdsClient
 from google.ads.googleads.errors import GoogleAdsException
 
 from .utils import micros_to_currency
+from .validation import (
+    validate_customer_id, validate_numeric_id, validate_enum,
+    sanitize_gaql_string, validate_date_range, validate_positive_number,
+    CAMPAIGN_STATUSES, AD_STATUSES, KEYWORD_STATUSES, KEYWORD_MATCH_TYPES,
+    AD_TYPES, DATE_RANGES, ValidationError,
+)
 
 logger = structlog.get_logger(__name__)
 
@@ -34,6 +40,13 @@ class KeywordTools:
         ]
         """
         try:
+            customer_id = validate_customer_id(customer_id)
+            ad_group_id = validate_numeric_id(ad_group_id, "ad_group_id")
+            for kw in keywords:
+                if "match_type" in kw:
+                    kw["match_type"] = validate_enum(kw["match_type"], KEYWORD_MATCH_TYPES, "match_type")
+                kw["text"] = sanitize_gaql_string(kw["text"])
+
             client = self.auth_manager.get_client(customer_id)
             ad_group_criterion_service = client.get_service("AdGroupCriterionService")
             
@@ -71,12 +84,40 @@ class KeywordTools:
                 
                 operations.append(operation)
             
-            # Execute all operations
-            response = ad_group_criterion_service.mutate_ad_group_criteria(
-                customer_id=customer_id,
-                operations=operations,
-            )
-            
+            # Execute all operations, with automatic policy exemption retry
+            try:
+                response = ad_group_criterion_service.mutate_ad_group_criteria(
+                    customer_id=customer_id,
+                    operations=operations,
+                )
+            except GoogleAdsException as ex:
+                # Check if all errors are exemptible policy violations
+                exemption_keys_by_op: Dict[int, list] = {}
+                all_exemptible = True
+                for error in ex.failure.errors:
+                    if not error.details.policy_violation_details.is_exemptible:
+                        all_exemptible = False
+                        break
+                    op_index = error.location.field_path_elements[0].index
+                    key = client.get_type("PolicyViolationKey")
+                    key.policy_name = error.details.policy_violation_details.key.policy_name
+                    key.violating_text = error.details.policy_violation_details.key.violating_text
+                    exemption_keys_by_op.setdefault(op_index, []).append(key)
+
+                if not all_exemptible:
+                    raise
+
+                # Retry with exemption keys attached to each operation
+                logger.info("Retrying keywords with policy exemptions",
+                            exemptions=len(exemption_keys_by_op))
+                for op_idx, keys in exemption_keys_by_op.items():
+                    for k in keys:
+                        operations[op_idx].exempt_policy_violation_keys.append(k)
+                response = ad_group_criterion_service.mutate_ad_group_criteria(
+                    customer_id=customer_id,
+                    operations=operations,
+                )
+
             # Extract results
             added_keywords = []
             for i, result in enumerate(response.results):
@@ -88,21 +129,21 @@ class KeywordTools:
                     "cpc_bid": micros_to_currency(keywords[i].get("cpc_bid_micros", 0)),
                     "resource_name": result.resource_name
                 })
-            
+
             logger.info(
                 f"Added keywords to ad group",
                 customer_id=customer_id,
                 ad_group_id=ad_group_id,
                 keywords_count=len(added_keywords)
             )
-            
+
             return {
                 "success": True,
                 "keywords": added_keywords,
                 "count": len(added_keywords),
                 "ad_group_id": ad_group_id
             }
-            
+
         except GoogleAdsException as e:
             logger.error(f"Failed to add keywords: {e}")
             return {
@@ -137,6 +178,13 @@ class KeywordTools:
         - Ad group level: add_negative_keywords(customer_id='123', keywords=['trial'], ad_group_id='789')
         """
         try:
+            customer_id = validate_customer_id(customer_id)
+            if campaign_id:
+                campaign_id = validate_numeric_id(campaign_id, "campaign_id")
+            if ad_group_id:
+                ad_group_id = validate_numeric_id(ad_group_id, "ad_group_id")
+            keywords = [sanitize_gaql_string(kw) for kw in keywords]
+
             client = self.auth_manager.get_client(customer_id)
             
             if campaign_id:
@@ -255,10 +303,17 @@ class KeywordTools:
     ) -> Dict[str, Any]:
         """List keywords with performance data."""
         try:
+            customer_id = validate_customer_id(customer_id)
+            if ad_group_id:
+                ad_group_id = validate_numeric_id(ad_group_id, "ad_group_id")
+            if campaign_id:
+                campaign_id = validate_numeric_id(campaign_id, "campaign_id")
+
             client = self.auth_manager.get_client(customer_id)
             googleads_service = client.get_service("GoogleAdsService")
             
-            # Build query
+            # Build query — ad_group_criterion does NOT support metrics
+            # with date segmentation. Use get_keyword_performance() for metrics.
             query = """
                 SELECT
                     ad_group_criterion.criterion_id,
@@ -270,26 +325,17 @@ class KeywordTools:
                     ad_group.id,
                     ad_group.name,
                     campaign.id,
-                    campaign.name,
-                    metrics.clicks,
-                    metrics.impressions,
-                    metrics.cost_micros,
-                    metrics.conversions
+                    campaign.name
                 FROM ad_group_criterion
                 WHERE ad_group_criterion.type = KEYWORD
             """
-            
+
             # Add filters
             conditions = []
             if ad_group_id:
                 conditions.append(f"ad_group.id = {ad_group_id}")
             if campaign_id:
                 conditions.append(f"campaign.id = {campaign_id}")
-                
-            if conditions:
-                query += " AND " + " AND ".join(conditions)
-                
-            query += " AND segments.date DURING LAST_30_DAYS"
                 
             response = googleads_service.search(
                 customer_id=customer_id, query=query
@@ -309,16 +355,7 @@ class KeywordTools:
                     "campaign_id": str(row.campaign.id),
                     "campaign_name": str(row.campaign.name)
                 }
-                
-                # Add performance metrics if available
-                if hasattr(row, 'metrics'):
-                    keyword_data["metrics"] = {
-                        "clicks": int(row.metrics.clicks),
-                        "impressions": int(row.metrics.impressions),
-                        "cost": micros_to_currency(row.metrics.cost_micros),
-                        "conversions": float(row.metrics.conversions)
-                    }
-                
+
                 keywords.append(keyword_data)
             
             return {
@@ -355,6 +392,10 @@ class KeywordTools:
     ) -> Dict[str, Any]:
         """Update the CPC bid for a specific keyword."""
         try:
+            customer_id = validate_customer_id(customer_id)
+            ad_group_id = validate_numeric_id(ad_group_id, "ad_group_id")
+            keyword_id = validate_numeric_id(keyword_id, "keyword_id")
+
             client = self.auth_manager.get_client(customer_id)
             ad_group_criterion_service = client.get_service("AdGroupCriterionService")
             
@@ -400,6 +441,10 @@ class KeywordTools:
     ) -> Dict[str, Any]:
         """Delete a specific keyword."""
         try:
+            customer_id = validate_customer_id(customer_id)
+            ad_group_id = validate_numeric_id(ad_group_id, "ad_group_id")
+            keyword_id = validate_numeric_id(keyword_id, "keyword_id")
+
             client = self.auth_manager.get_client(customer_id)
             ad_group_criterion_service = client.get_service("AdGroupCriterionService")
             
@@ -434,6 +479,10 @@ class KeywordTools:
     ) -> Dict[str, Any]:
         """Pause a specific keyword."""
         try:
+            customer_id = validate_customer_id(customer_id)
+            ad_group_id = validate_numeric_id(ad_group_id, "ad_group_id")
+            keyword_id = validate_numeric_id(keyword_id, "keyword_id")
+
             client = self.auth_manager.get_client(customer_id)
             ad_group_criterion_service = client.get_service("AdGroupCriterionService")
             
@@ -479,6 +528,10 @@ class KeywordTools:
     ) -> Dict[str, Any]:
         """Enable a paused keyword."""
         try:
+            customer_id = validate_customer_id(customer_id)
+            ad_group_id = validate_numeric_id(ad_group_id, "ad_group_id")
+            keyword_id = validate_numeric_id(keyword_id, "keyword_id")
+
             client = self.auth_manager.get_client(customer_id)
             ad_group_criterion_service = client.get_service("AdGroupCriterionService")
             
@@ -524,6 +577,11 @@ class KeywordTools:
     ) -> Dict[str, Any]:
         """Get keyword performance data with quality scores."""
         try:
+            customer_id = validate_customer_id(customer_id)
+            if ad_group_id:
+                ad_group_id = validate_numeric_id(ad_group_id, "ad_group_id")
+            date_range = validate_date_range(date_range)
+
             client = self.auth_manager.get_client(customer_id)
             googleads_service = client.get_service("GoogleAdsService")
             
@@ -603,6 +661,14 @@ class KeywordTools:
     ) -> Dict[str, Any]:
         """Auto-suggest negative keywords based on wasteful search terms."""
         try:
+            customer_id = validate_customer_id(customer_id)
+            if campaign_id:
+                campaign_id = validate_numeric_id(campaign_id, "campaign_id")
+            if ad_group_id:
+                ad_group_id = validate_numeric_id(ad_group_id, "ad_group_id")
+            date_range = validate_date_range(date_range)
+            min_cost = validate_positive_number(min_cost, "min_cost")
+
             client = self.auth_manager.get_client(customer_id)
             googleads_service = client.get_service("GoogleAdsService")
             
@@ -689,6 +755,14 @@ class KeywordTools:
     ) -> Dict[str, Any]:
         """Get comprehensive search terms analysis with keyword opportunities."""
         try:
+            customer_id = validate_customer_id(customer_id)
+            if campaign_id:
+                campaign_id = validate_numeric_id(campaign_id, "campaign_id")
+            if ad_group_id:
+                ad_group_id = validate_numeric_id(ad_group_id, "ad_group_id")
+            date_range = validate_date_range(date_range)
+            min_impressions = validate_positive_number(min_impressions, "min_impressions")
+
             client = self.auth_manager.get_client(customer_id)
             googleads_service = client.get_service("GoogleAdsService")
             

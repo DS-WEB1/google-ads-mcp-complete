@@ -9,6 +9,11 @@ from google.ads.googleads.errors import GoogleAdsException
 from google.protobuf.field_mask_pb2 import FieldMask
 
 from .utils import currency_to_micros, micros_to_currency, parse_date
+from .validation import (
+    validate_customer_id, validate_numeric_id, validate_enum,
+    sanitize_gaql_string, validate_date_range,
+    CAMPAIGN_STATUSES, CAMPAIGN_TYPES, BIDDING_STRATEGY_TYPES, ValidationError,
+)
 
 logger = structlog.get_logger(__name__)
 
@@ -27,13 +32,19 @@ class CampaignTools:
         budget_amount: float,
         campaign_type: str = "SEARCH",
         bidding_strategy: str = "MAXIMIZE_CLICKS",
+        status: str = "ENABLED",
         start_date: Optional[str] = None,
         end_date: Optional[str] = None,
         target_locations: Optional[List[str]] = None,
         target_languages: Optional[List[str]] = None,
+        target_cpa_micros: Optional[int] = None,
+        target_roas: Optional[float] = None,
+        target_search_network: Optional[bool] = None,
     ) -> Dict[str, Any]:
         """Create a new campaign with budget and settings."""
         try:
+            customer_id = validate_customer_id(customer_id)
+            campaign_type = validate_enum(campaign_type, CAMPAIGN_TYPES, "campaign_type")
             client = self.auth_manager.get_client(customer_id)
             
             # First create a budget
@@ -46,6 +57,7 @@ class CampaignTools:
             budget.name = f"{name} - Budget"
             budget.amount_micros = currency_to_micros(budget_amount)
             budget.delivery_method = client.enums.BudgetDeliveryMethodEnum.STANDARD
+            budget.explicitly_shared = False
             
             # Add the budget
             budget_response = budget_service.mutate_campaign_budgets(
@@ -81,12 +93,43 @@ class CampaignTools:
                 channel_subtype_enum = client.enums.AdvertisingChannelSubTypeEnum
                 campaign.advertising_channel_sub_type = channel_subtype_enum.SHOPPING_COMPARISON_LISTING_ADS
             
-            # Set bidding strategy (API v21 compatible) 
-            # For now, use manual CPC which we know works
-            manual_cpc = client.get_type("ManualCpc")
-            campaign.manual_cpc = manual_cpc
-            
-            # TODO: Add other bidding strategies once we figure out the correct API v21 syntax
+            # Set bidding strategy (API v23 compatible)
+            strategy = bidding_strategy.upper() if bidding_strategy else "MAXIMIZE_CLICKS"
+
+            if strategy == "MANUAL_CPC":
+                campaign.manual_cpc = client.get_type("ManualCpc")
+            elif strategy == "ENHANCED_CPC":
+                manual_cpc = client.get_type("ManualCpc")
+                manual_cpc.enhanced_cpc_enabled = True
+                campaign.manual_cpc = manual_cpc
+            elif strategy == "MAXIMIZE_CLICKS":
+                # v23: maximize_clicks renamed to target_spend
+                campaign.target_spend = client.get_type("TargetSpend")
+            elif strategy == "MAXIMIZE_CONVERSIONS":
+                max_conv = client.get_type("MaximizeConversions")
+                if target_cpa_micros:
+                    max_conv.target_cpa_micros = target_cpa_micros
+                campaign.maximize_conversions = max_conv
+            elif strategy == "TARGET_CPA":
+                target_cpa = client.get_type("TargetCpa")
+                if target_cpa_micros:
+                    target_cpa.target_cpa_micros = target_cpa_micros
+                campaign.target_cpa = target_cpa
+            elif strategy == "MAXIMIZE_CONVERSION_VALUE":
+                campaign.maximize_conversion_value = client.get_type("MaximizeConversionValue")
+            elif strategy == "TARGET_ROAS":
+                target_roas_obj = client.get_type("TargetRoas")
+                if target_roas:
+                    target_roas_obj.target_roas = target_roas
+                campaign.target_roas = target_roas_obj
+            elif strategy == "TARGET_IMPRESSION_SHARE":
+                tis = client.get_type("TargetImpressionShare")
+                tis.location = client.enums.TargetImpressionShareLocationEnum.ANYWHERE_ON_PAGE
+                tis.location_fraction_micros = 500000  # 50%
+                campaign.target_impression_share = tis
+            else:
+                logger.warning(f"Unknown bidding strategy '{strategy}', falling back to Manual CPC")
+                campaign.manual_cpc = client.get_type("ManualCpc")
                 
             # Set dates
             if start_date:
@@ -97,11 +140,19 @@ class CampaignTools:
             # Set network settings for Search campaigns
             if campaign_type.upper() == "SEARCH":
                 campaign.network_settings.target_google_search = True
-                campaign.network_settings.target_search_network = True
+                # Default to including search partners unless explicitly disabled
+                if target_search_network is not None:
+                    campaign.network_settings.target_search_network = target_search_network
+                else:
+                    campaign.network_settings.target_search_network = True
                 campaign.network_settings.target_partner_search_network = False
-                
-            # Set campaign status
-            campaign.status = client.enums.CampaignStatusEnum.ENABLED
+
+            # Set campaign status (ENABLED or PAUSED)
+            status_upper = status.upper() if status else "ENABLED"
+            if status_upper == "PAUSED":
+                campaign.status = client.enums.CampaignStatusEnum.PAUSED
+            else:
+                campaign.status = client.enums.CampaignStatusEnum.ENABLED
             
             # Set required API v21 fields - use proper enum for EU political advertising
             # DOES_NOT_CONTAIN_EU_POLITICAL_ADVERTISING since we're targeting non-EU only
@@ -116,11 +167,11 @@ class CampaignTools:
             campaign_resource_name = campaign_response.results[0].resource_name
             campaign_id = campaign_resource_name.split("/")[-1]
             
-            # Skip geo targeting for now - will fix separately
-            # locations_to_target = target_locations or ["US"]  # Default to US only  
-            # await self._add_geo_targeting(
-            #     client, customer_id, campaign_id, locations_to_target
-            # )
+            # Add geo targeting if locations provided
+            if target_locations:
+                await self._add_geo_targeting(
+                    client, customer_id, campaign_id, target_locations
+                )
                 
             # Add language targeting if provided
             if target_languages:
@@ -147,33 +198,48 @@ class CampaignTools:
     async def _add_geo_targeting(
         self, client: GoogleAdsClient, customer_id: str, campaign_id: str, locations: List[str]
     ) -> None:
-        """Add geographic targeting to a campaign."""
+        """Add geographic targeting to a campaign.
+
+        Accepts either numeric geo target constant IDs (e.g. '2036' for Australia)
+        or location names (e.g. 'Australia') which will be resolved via the API.
+        """
         campaign_criterion_service = client.get_service("CampaignCriterionService")
-        geo_target_constant_service = client.get_service("GeoTargetConstantService")
-        
+
         operations = []
-        
+
         for location in locations:
-            # Search for location
-            gtc_query = f"""
-                SELECT geo_target_constant.id, geo_target_constant.name
-                FROM geo_target_constant
-                WHERE geo_target_constant.name = '{location}'
-                    AND geo_target_constant.status = 'ENABLED'
-            """
-            
-            # Use the correct method for API v21
-            gtc_response = geo_target_constant_service.search_geo_target_constants(query=gtc_query)
-            
-            for row in gtc_response:
+            location = str(location).strip()
+
+            if location.isdigit():
+                # Numeric ID — use directly as geo target constant
+                geo_target_resource = f"geoTargetConstants/{location}"
                 operation = client.get_type("CampaignCriterionOperation")
                 criterion = operation.create
                 criterion.campaign = f"customers/{customer_id}/campaigns/{campaign_id}"
-                criterion.location.geo_target_constant = row.geo_target_constant.resource_name
+                criterion.location.geo_target_constant = geo_target_resource
                 criterion.negative = False
                 operations.append(operation)
-                break
-                
+            else:
+                # Name-based lookup via suggest_geo_target_constants
+                geo_target_constant_service = client.get_service("GeoTargetConstantService")
+
+                gtc_request = client.get_type("SuggestGeoTargetConstantsRequest")
+                gtc_request.locale = "en"
+                gtc_request.location_names.names.append(sanitize_gaql_string(location))
+
+                gtc_response = geo_target_constant_service.suggest_geo_target_constants(
+                    request=gtc_request
+                )
+
+                for suggestion in gtc_response.geo_target_constant_suggestions:
+                    operation = client.get_type("CampaignCriterionOperation")
+                    criterion = operation.create
+                    criterion.campaign = f"customers/{customer_id}/campaigns/{campaign_id}"
+                    criterion.location.geo_target_constant = suggestion.geo_target_constant.resource_name
+                    criterion.negative = False
+                    operations.append(operation)
+                    break  # Use the first (best) match
+
         if operations:
             campaign_criterion_service.mutate_campaign_criteria(
                 customer_id=customer_id,
@@ -186,18 +252,23 @@ class CampaignTools:
         """Add language targeting to a campaign."""
         campaign_criterion_service = client.get_service("CampaignCriterionService")
         
-        # Language codes mapping
+        # Language codes mapping (accepts full names or ISO 639-1 codes)
         language_map = {
-            "English": "1000",  # English
-            "Spanish": "1003",  # Spanish
-            "French": "1002",   # French
-            "German": "1001",   # German
-            "Italian": "1004",  # Italian
-            "Portuguese": "1014", # Portuguese
-            "Dutch": "1010",    # Dutch
-            "Russian": "1023",  # Russian
-            "Japanese": "1005", # Japanese
-            "Chinese": "1017",  # Chinese (simplified)
+            "English": "1000", "en": "1000",
+            "Spanish": "1003", "es": "1003",
+            "French": "1002",  "fr": "1002",
+            "German": "1001",  "de": "1001",
+            "Italian": "1004", "it": "1004",
+            "Portuguese": "1014", "pt": "1014",
+            "Dutch": "1010",   "nl": "1010",
+            "Russian": "1023", "ru": "1023",
+            "Japanese": "1005", "ja": "1005",
+            "Chinese": "1017", "zh": "1017",
+            "Korean": "1012",  "ko": "1012",
+            "Arabic": "1019",  "ar": "1019",
+            "Hindi": "1023",   "hi": "1023",
+            "Thai": "1044",    "th": "1044",
+            "Vietnamese": "1040", "vi": "1040",
         }
         
         operations = []
@@ -226,9 +297,12 @@ class CampaignTools:
         start_date: Optional[str] = None,
         end_date: Optional[str] = None,
         bidding_strategy: Optional[str] = None,
+        target_search_network: Optional[bool] = None,
+        target_cpa_micros: Optional[int] = None,
+        target_roas: Optional[float] = None,
     ) -> Dict[str, Any]:
         """Update campaign settings.
-        
+
         Args:
             customer_id: The customer ID
             campaign_id: The campaign ID to update
@@ -236,12 +310,17 @@ class CampaignTools:
             status: New campaign status (ENABLED, PAUSED, REMOVED)
             start_date: New start date (YYYY-MM-DD format)
             end_date: New end date (YYYY-MM-DD format)
-            bidding_strategy: Portfolio bidding strategy resource name (e.g., customers/123/biddingStrategies/456)
+            bidding_strategy: Standard strategy name (MAXIMIZE_CONVERSIONS, TARGET_CPA, etc.) or portfolio resource name
+            target_search_network: Include Google Search Partners (true/false)
         """
         try:
+            customer_id = validate_customer_id(customer_id)
+            campaign_id = validate_numeric_id(campaign_id, "campaign_id")
+            if status is not None:
+                status = validate_enum(status, CAMPAIGN_STATUSES, "status")
             client = self.auth_manager.get_client(customer_id)
             campaign_service = client.get_service("CampaignService")
-            
+
             campaign_operation = client.get_type("CampaignOperation")
             campaign = campaign_operation.update
             campaign.resource_name = f"customers/{customer_id}/campaigns/{campaign_id}"
@@ -269,10 +348,61 @@ class CampaignTools:
             if end_date is not None:
                 campaign.end_date = parse_date(end_date).strftime("%Y%m%d")
                 update_mask.append("end_date")
-                
+
+            if target_search_network is not None:
+                campaign.network_settings.target_search_network = target_search_network
+                update_mask.append("network_settings.target_search_network")
+
             if bidding_strategy is not None:
-                campaign.bidding_strategy = bidding_strategy
-                update_mask.append("bidding_strategy")
+                strategy = bidding_strategy.upper()
+                # Google Ads API v23 field names and subfield FieldMask paths.
+                # Proto-plus requires subfield paths — using a parent message
+                # field alone causes FIELD_HAS_SUBFIELDS error.
+                STANDARD_STRATEGIES = {
+                    "MANUAL_CPC", "ENHANCED_CPC", "MAXIMIZE_CLICKS",
+                    "MAXIMIZE_CONVERSIONS", "TARGET_CPA",
+                    "MAXIMIZE_CONVERSION_VALUE", "TARGET_ROAS",
+                    "TARGET_IMPRESSION_SHARE",
+                }
+                if strategy in STANDARD_STRATEGIES:
+                    if strategy == "MANUAL_CPC":
+                        campaign.manual_cpc.enhanced_cpc_enabled = False
+                        update_mask.append("manual_cpc.enhanced_cpc_enabled")
+                    elif strategy == "ENHANCED_CPC":
+                        campaign.manual_cpc.enhanced_cpc_enabled = True
+                        update_mask.append("manual_cpc.enhanced_cpc_enabled")
+                    elif strategy == "MAXIMIZE_CLICKS":
+                        # v23: maximize_clicks renamed to target_spend
+                        campaign.target_spend.target_spend_micros = 0
+                        update_mask.append("target_spend.target_spend_micros")
+                    elif strategy == "MAXIMIZE_CONVERSIONS":
+                        cpa = target_cpa_micros if target_cpa_micros else 0
+                        campaign.maximize_conversions.target_cpa_micros = cpa
+                        update_mask.append("maximize_conversions.target_cpa_micros")
+                    elif strategy == "TARGET_CPA":
+                        cpa = target_cpa_micros if target_cpa_micros else 0
+                        campaign.target_cpa.target_cpa_micros = cpa
+                        update_mask.append("target_cpa.target_cpa_micros")
+                    elif strategy == "MAXIMIZE_CONVERSION_VALUE":
+                        roas = target_roas if target_roas else 0
+                        campaign.maximize_conversion_value.target_roas = roas
+                        update_mask.append("maximize_conversion_value.target_roas")
+                    elif strategy == "TARGET_ROAS":
+                        roas = target_roas if target_roas else 0
+                        campaign.target_roas.target_roas = roas
+                        update_mask.append("target_roas.target_roas")
+                    elif strategy == "TARGET_IMPRESSION_SHARE":
+                        loc_enum = client.enums.TargetImpressionShareLocationEnum
+                        campaign.target_impression_share.location = loc_enum.ANYWHERE_ON_PAGE
+                        campaign.target_impression_share.location_fraction_micros = 500000
+                        campaign.target_impression_share.cpc_bid_ceiling_micros = 10000000
+                        update_mask.append("target_impression_share.location")
+                        update_mask.append("target_impression_share.location_fraction_micros")
+                        update_mask.append("target_impression_share.cpc_bid_ceiling_micros")
+                else:
+                    # Assume it's a portfolio bidding strategy resource name
+                    campaign.bidding_strategy = bidding_strategy
+                    update_mask.append("bidding_strategy")
                 
             # Set the update mask
             campaign_operation.update_mask.CopyFrom(
@@ -314,9 +444,14 @@ class CampaignTools:
     ) -> Dict[str, Any]:
         """List all campaigns with optional filters."""
         try:
+            customer_id = validate_customer_id(customer_id)
+            if status:
+                status = validate_enum(status, CAMPAIGN_STATUSES, "status")
+            if campaign_type:
+                campaign_type = validate_enum(campaign_type, CAMPAIGN_TYPES, "campaign_type")
             client = self.auth_manager.get_client(customer_id)
             googleads_service = client.get_service("GoogleAdsService")
-            
+
             query = """
                 SELECT
                     campaign.id,
@@ -325,13 +460,13 @@ class CampaignTools:
                     campaign.advertising_channel_type
                 FROM campaign
             """
-            
+
             conditions = []
             if status:
-                conditions.append(f"campaign.status = '{status.upper()}'")
+                conditions.append(f"campaign.status = '{status}'")
             if campaign_type:
-                conditions.append(f"campaign.advertising_channel_type = '{campaign_type.upper()}'")
-                
+                conditions.append(f"campaign.advertising_channel_type = '{campaign_type}'")
+
             if conditions:
                 query += " AND " + " AND ".join(conditions)
                 
@@ -372,6 +507,8 @@ class CampaignTools:
     async def get_campaign(self, customer_id: str, campaign_id: str) -> Dict[str, Any]:
         """Get detailed campaign information."""
         try:
+            customer_id = validate_customer_id(customer_id)
+            campaign_id = validate_numeric_id(campaign_id, "campaign_id")
             client = self.auth_manager.get_client(customer_id)
             googleads_service = client.get_service("GoogleAdsService")
             
@@ -386,8 +523,6 @@ class CampaignTools:
                     campaign_budget.amount_micros,
                     campaign_budget.delivery_method,
                     campaign.bidding_strategy_type,
-                    campaign.start_date,
-                    campaign.end_date,
                     campaign.network_settings.target_google_search,
                     campaign.network_settings.target_search_network,
                     campaign.network_settings.target_partner_search_network,
@@ -397,8 +532,7 @@ class CampaignTools:
                     metrics.cost_micros,
                     metrics.conversions,
                     metrics.average_cpc,
-                    metrics.ctr,
-                    metrics.conversions
+                    metrics.ctr
                 FROM campaign
                 WHERE campaign.id = {campaign_id}
                     AND segments.date DURING LAST_30_DAYS
@@ -423,10 +557,6 @@ class CampaignTools:
                             "delivery_method": row.campaign_budget.delivery_method.name,
                         },
                         "bidding_strategy": row.campaign.bidding_strategy_type.name,
-                        "dates": {
-                            "start": row.campaign.start_date,
-                            "end": row.campaign.end_date,
-                        },
                         "network_settings": {
                             "google_search": row.campaign.network_settings.target_google_search,
                             "search_network": row.campaign.network_settings.target_search_network,
@@ -457,6 +587,8 @@ class CampaignTools:
     async def delete_campaign(self, customer_id: str, campaign_id: str) -> Dict[str, Any]:
         """Delete a campaign permanently."""
         try:
+            customer_id = validate_customer_id(customer_id)
+            campaign_id = validate_numeric_id(campaign_id, "campaign_id")
             client = self.auth_manager.get_client(customer_id)
             campaign_service = client.get_service("CampaignService")
             
@@ -500,6 +632,8 @@ class CampaignTools:
     ) -> Dict[str, Any]:
         """Copy an existing campaign with a new name and optionally new budget."""
         try:
+            customer_id = validate_customer_id(customer_id)
+            source_campaign_id = validate_numeric_id(source_campaign_id, "source_campaign_id")
             client = self.auth_manager.get_client(customer_id)
             
             # First, get the source campaign details
@@ -580,12 +714,14 @@ class CampaignTools:
                 ]
         """
         try:
+            customer_id = validate_customer_id(customer_id)
+            campaign_id = validate_numeric_id(campaign_id, "campaign_id")
             client = self.auth_manager.get_client(customer_id)
             campaign_criterion_service = client.get_service("CampaignCriterionService")
-            
+
             operations = []
             applied_schedules = []
-            
+
             day_of_week_map = {
                 "MONDAY": client.enums.DayOfWeekEnum.MONDAY,
                 "TUESDAY": client.enums.DayOfWeekEnum.TUESDAY,
@@ -668,7 +804,10 @@ class CampaignTools:
             date_range: Date range for performance metrics
         """
         try:
-            # Get basic campaign info only 
+            customer_id = validate_customer_id(customer_id)
+            campaign_id = validate_numeric_id(campaign_id, "campaign_id")
+            date_range = validate_date_range(date_range)
+            # Get basic campaign info only
             campaign_info = await self.get_campaign(customer_id, campaign_id)
             if not campaign_info.get("success"):
                 return campaign_info
@@ -705,7 +844,7 @@ class CampaignTools:
                                 "ctr": f"{perf_row.metrics.ctr:.2%}" if perf_row.metrics.ctr else "0.00%"
                             }
                             break
-                    except: pass
+                    except Exception: pass
                     
                     # Get ads in this ad group (basic info only)
                     ads_summary = []
@@ -718,7 +857,7 @@ class CampaignTools:
                                 "ad_type": str(ad_row.ad_group_ad.ad.type.name),
                                 "status": str(ad_row.ad_group_ad.status.name)
                             })
-                    except: pass
+                    except Exception: pass
                     
                     ad_groups_summary.append({
                         "ad_group_id": ad_group_id,
@@ -729,7 +868,7 @@ class CampaignTools:
                         "ads_count": len(ads_summary)
                     })
                     
-            except: pass  # Skip if error
+            except Exception: pass  # Skip if error
             
             # Simple keyword count using basic query
             positive_keywords = 0
@@ -791,7 +930,7 @@ class CampaignTools:
                     extensions_count["structured_snippets"] = snippet_result.get("count", 0)
                     extensions_count["total"] += extensions_count["structured_snippets"]
                     
-            except: 
+            except Exception:
                 # Fallback to known counts
                 extensions_count = {"sitelinks": 0, "callouts": 49, "structured_snippets": 0, "call_extensions": 0, "total": 49}
             
@@ -805,7 +944,7 @@ class CampaignTools:
                 schedule_summary["has_scheduling"] = len(schedules) > 0
                 if len(schedules) == 5:  # Likely business hours if exactly 5 schedules
                     schedule_summary["business_hours_only"] = True
-            except: pass  # Skip if error
+            except Exception: pass  # Skip if error
             
             # Count audiences
             audience_targeting = {"has_audiences": False, "user_lists": 0, "user_interests": 0, "custom_audiences": 0, "total": 0}
@@ -819,7 +958,7 @@ class CampaignTools:
                     if criterion_type == "USER_LIST": audience_targeting["user_lists"] += 1
                     elif criterion_type == "USER_INTEREST": audience_targeting["user_interests"] += 1
                     elif criterion_type == "CUSTOM_AUDIENCE": audience_targeting["custom_audiences"] += 1
-            except: pass  # Skip if error
+            except Exception: pass  # Skip if error
             
             # Calculate real optimization score based on best practices
             total_negative_kw = negative_keywords + campaign_negative_keywords
