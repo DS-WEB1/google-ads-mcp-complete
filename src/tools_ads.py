@@ -409,52 +409,108 @@ class AdTools:
             )
             if has_content_update:
                 ad_service = client.get_service("AdService")
-                ad_operation = client.get_type("AdOperation")
-                ad = ad_operation.update
-                ad.resource_name = ad_service.ad_path(customer_id, ad_id)
+                ad_group_ad_service = client.get_service("AdGroupAdService")
+                googleads_service = client.get_service("GoogleAdsService")
+
+                # Detect ad type so we update the correct creative fields.
+                type_query = f"""
+                    SELECT ad_group_ad.ad.id, ad_group_ad.ad.type
+                    FROM ad_group_ad
+                    WHERE ad_group_ad.ad.id = {ad_id}
+                    AND ad_group.id = {ad_group_id}
+                    LIMIT 1
+                """
+                type_response = googleads_service.search(
+                    customer_id=customer_id, query=type_query
+                )
+                ad_type = None
+                for row in type_response:
+                    ad_type = row.ad_group_ad.ad.type_.name
+                    break
 
                 content_mask = FieldMask()
 
-                if final_urls:
-                    ad.final_urls.clear()
-                    ad.final_urls.extend(final_urls)
-                    content_mask.paths.append("final_urls")
-                    updated_fields.append("final_urls")
+                if ad_type == "APP_AD":
+                    ad_group_ad_operation = client.get_type("AdGroupAdOperation")
+                    ad_group_ad = ad_group_ad_operation.update
+                    ad_group_ad.resource_name = ad_group_ad_service.ad_group_ad_path(
+                        customer_id, ad_group_id, ad_id
+                    )
+                    ad = ad_group_ad.ad
 
-                if headlines:
-                    ad.responsive_search_ad.headlines.clear()
-                    for headline in headlines[:15]:
-                        headline_asset = client.get_type("AdTextAsset")
-                        headline_asset.text = headline
-                        ad.responsive_search_ad.headlines.append(headline_asset)
-                    content_mask.paths.append("responsive_search_ad.headlines")
-                    updated_fields.append("responsive_search_ad.headlines")
+                    if headlines:
+                        ad.app_ad.headlines.clear()
+                        for headline in headlines[:5]:
+                            headline_asset = client.get_type("AdTextAsset")
+                            headline_asset.text = headline
+                            ad.app_ad.headlines.append(headline_asset)
+                        content_mask.paths.append("ad.app_ad.headlines")
+                        updated_fields.append("ad.app_ad.headlines")
 
-                if descriptions:
-                    ad.responsive_search_ad.descriptions.clear()
-                    for description in descriptions[:4]:
-                        description_asset = client.get_type("AdTextAsset")
-                        description_asset.text = description
-                        ad.responsive_search_ad.descriptions.append(description_asset)
-                    content_mask.paths.append("responsive_search_ad.descriptions")
-                    updated_fields.append("responsive_search_ad.descriptions")
+                    if descriptions:
+                        ad.app_ad.descriptions.clear()
+                        for description in descriptions[:5]:
+                            description_asset = client.get_type("AdTextAsset")
+                            description_asset.text = description
+                            ad.app_ad.descriptions.append(description_asset)
+                        content_mask.paths.append("ad.app_ad.descriptions")
+                        updated_fields.append("ad.app_ad.descriptions")
 
-                if path1 is not None:
-                    ad.responsive_search_ad.path1 = path1
-                    content_mask.paths.append("responsive_search_ad.path1")
-                    updated_fields.append("responsive_search_ad.path1")
+                    if final_urls:
+                        ad.final_urls.clear()
+                        ad.final_urls.extend(final_urls)
+                        content_mask.paths.append("ad.final_urls")
+                        updated_fields.append("ad.final_urls")
 
-                if path2 is not None:
-                    ad.responsive_search_ad.path2 = path2
-                    content_mask.paths.append("responsive_search_ad.path2")
-                    updated_fields.append("responsive_search_ad.path2")
+                    ad_group_ad_operation.update_mask = content_mask
+                    response = ad_group_ad_service.mutate_ad_group_ads(
+                        customer_id=customer_id,
+                        operations=[ad_group_ad_operation],
+                    )
+                else:
+                    ad_operation = client.get_type("AdOperation")
+                    ad = ad_operation.update
+                    ad.resource_name = ad_service.ad_path(customer_id, ad_id)
 
-                ad_operation.update_mask = content_mask
+                    if final_urls:
+                        ad.final_urls.clear()
+                        ad.final_urls.extend(final_urls)
+                        content_mask.paths.append("final_urls")
+                        updated_fields.append("final_urls")
 
-                response = ad_service.mutate_ads(
-                    customer_id=customer_id,
-                    operations=[ad_operation]
-                )
+                    if headlines:
+                        ad.responsive_search_ad.headlines.clear()
+                        for headline in headlines[:15]:
+                            headline_asset = client.get_type("AdTextAsset")
+                            headline_asset.text = headline
+                            ad.responsive_search_ad.headlines.append(headline_asset)
+                        content_mask.paths.append("responsive_search_ad.headlines")
+                        updated_fields.append("responsive_search_ad.headlines")
+
+                    if descriptions:
+                        ad.responsive_search_ad.descriptions.clear()
+                        for description in descriptions[:4]:
+                            description_asset = client.get_type("AdTextAsset")
+                            description_asset.text = description
+                            ad.responsive_search_ad.descriptions.append(description_asset)
+                        content_mask.paths.append("responsive_search_ad.descriptions")
+                        updated_fields.append("responsive_search_ad.descriptions")
+
+                    if path1 is not None:
+                        ad.responsive_search_ad.path1 = path1
+                        content_mask.paths.append("responsive_search_ad.path1")
+                        updated_fields.append("responsive_search_ad.path1")
+
+                    if path2 is not None:
+                        ad.responsive_search_ad.path2 = path2
+                        content_mask.paths.append("responsive_search_ad.path2")
+                        updated_fields.append("responsive_search_ad.path2")
+
+                    ad_operation.update_mask = content_mask
+                    response = ad_service.mutate_ads(
+                        customer_id=customer_id,
+                        operations=[ad_operation],
+                    )
                 results.append(response.results[0].resource_name)
 
             return {
