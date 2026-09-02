@@ -316,6 +316,7 @@ class GoogleAdsTools:
                     "descriptions": {"type": "array"},
                     "final_urls": {"type": "array"},
                     "status": {"type": "string"},
+                    "image_asset_resource_names": {"type": "array"},
                 },
             },
             "pause_ad": {

@@ -362,7 +362,8 @@ class AdTools:
         final_urls: Optional[List[str]] = None,
         path1: Optional[str] = None,
         path2: Optional[str] = None,
-        status: Optional[str] = None
+        status: Optional[str] = None,
+        image_asset_resource_names: Optional[List[str]] = None,
     ) -> Dict[str, Any]:
         """Update an existing ad."""
         try:
@@ -406,6 +407,7 @@ class AdTools:
             has_content_update = (
                 headlines or descriptions or final_urls
                 or path1 is not None or path2 is not None
+                or image_asset_resource_names
             )
             if has_content_update:
                 ad_service = client.get_service("AdService")
@@ -455,6 +457,15 @@ class AdTools:
                             ad.app_ad.descriptions.append(description_asset)
                         content_mask.paths.append("app_ad.descriptions")
                         updated_fields.append("app_ad.descriptions")
+
+                    if image_asset_resource_names:
+                        ad.app_ad.images.clear()
+                        for resource_name in image_asset_resource_names[:20]:
+                            image_asset = client.get_type("AdImageAsset")
+                            image_asset.asset = resource_name
+                            ad.app_ad.images.append(image_asset)
+                        content_mask.paths.append("app_ad.images")
+                        updated_fields.append("app_ad.images")
 
                     ad_operation.update_mask = content_mask
                     response = ad_service.mutate_ads(
