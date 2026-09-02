@@ -447,21 +447,18 @@ class AdTools:
             deep_link.asset = app_ad.app_deep_link.asset
             new_app_ad.app_deep_link = deep_link
 
-        create_response = ad_group_ad_service.mutate_ad_group_ads(
-            customer_id=customer_id,
-            operations=[create_operation],
-        )
-        new_resource_name = create_response.results[0].resource_name
-        new_ad_id = new_resource_name.split("~")[-1]
-
         remove_operation = client.get_type("AdGroupAdOperation")
         remove_operation.remove = ad_group_ad_service.ad_group_ad_path(
             customer_id, ad_group_id, ad_id
         )
-        ad_group_ad_service.mutate_ad_group_ads(
+
+        # Remove first — app ad groups allow only one creative per ad group.
+        mutate_response = ad_group_ad_service.mutate_ad_group_ads(
             customer_id=customer_id,
-            operations=[remove_operation],
+            operations=[remove_operation, create_operation],
         )
+        new_resource_name = mutate_response.results[1].resource_name
+        new_ad_id = new_resource_name.split("~")[-1]
 
         updated_fields = []
         if headlines:
