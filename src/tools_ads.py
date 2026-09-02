@@ -352,139 +352,6 @@ class AdTools:
                 "error_type": "UnexpectedError"
             }
 
-    def _app_ad_text_assets(self, client: GoogleAdsClient, texts: List[str]) -> List[Any]:
-        """Build AdTextAsset list for app ad headlines/descriptions."""
-        assets = []
-        for text in texts:
-            asset = client.get_type("AdTextAsset")
-            asset.text = text
-            assets.append(asset)
-        return assets
-
-    async def _replace_app_ad(
-        self,
-        client: GoogleAdsClient,
-        customer_id: str,
-        ad_group_id: str,
-        ad_id: str,
-        headlines: Optional[List[str]] = None,
-        descriptions: Optional[List[str]] = None,
-    ) -> Dict[str, Any]:
-        """Replace an APP_AD by creating a new ad and removing the old one.
-
-        Google Ads API does not allow UPDATE on app_ad headlines/descriptions.
-        """
-        ad_group_ad_service = client.get_service("AdGroupAdService")
-        ad_group_service = client.get_service("AdGroupService")
-        googleads_service = client.get_service("GoogleAdsService")
-
-        query = f"""
-            SELECT
-                ad_group_ad.ad.id,
-                ad_group_ad.status,
-                ad_group_ad.ad.app_ad.headlines,
-                ad_group_ad.ad.app_ad.descriptions,
-                ad_group_ad.ad.app_ad.images,
-                ad_group_ad.ad.app_ad.youtube_videos,
-                ad_group_ad.ad.app_ad.html5_media_bundles,
-                ad_group_ad.ad.app_ad.mandatory_ad_text,
-                ad_group_ad.ad.app_ad.app_deep_link
-            FROM ad_group_ad
-            WHERE ad_group_ad.ad.id = {ad_id}
-            AND ad_group.id = {ad_group_id}
-            LIMIT 1
-        """
-        response = googleads_service.search(customer_id=customer_id, query=query)
-        existing = None
-        for row in response:
-            existing = row.ad_group_ad
-            break
-        if not existing:
-            raise ValueError(f"APP_AD {ad_id} not found in ad group {ad_group_id}")
-
-        app_ad = existing.ad.app_ad
-        final_headlines = headlines if headlines else [h.text for h in app_ad.headlines]
-        final_descriptions = (
-            descriptions if descriptions else [d.text for d in app_ad.descriptions]
-        )
-
-        if len(final_headlines) < 2:
-            raise ValueError("APP_AD requires at least 2 headlines")
-        if len(final_descriptions) < 2:
-            raise ValueError("APP_AD requires at least 2 descriptions")
-
-        create_operation = client.get_type("AdGroupAdOperation")
-        new_ad_group_ad = create_operation.create
-        new_ad_group_ad.ad_group = ad_group_service.ad_group_path(
-            customer_id, ad_group_id
-        )
-        new_ad_group_ad.status = existing.status
-
-        new_app_ad = new_ad_group_ad.ad.app_ad
-        for asset in self._app_ad_text_assets(client, final_headlines[:5]):
-            new_app_ad.headlines.append(asset)
-        for asset in self._app_ad_text_assets(client, final_descriptions[:5]):
-            new_app_ad.descriptions.append(asset)
-
-        for img in app_ad.images:
-            image_asset = client.get_type("AdImageAsset")
-            image_asset.asset = img.asset
-            new_app_ad.images.append(image_asset)
-        for video in app_ad.youtube_videos:
-            video_asset = client.get_type("AdVideoAsset")
-            video_asset.asset = video.asset
-            new_app_ad.youtube_videos.append(video_asset)
-        for bundle in app_ad.html5_media_bundles:
-            media_bundle = client.get_type("AdMediaBundleAsset")
-            media_bundle.asset = bundle.asset
-            new_app_ad.html5_media_bundles.append(media_bundle)
-        if app_ad.mandatory_ad_text.text:
-            mandatory = client.get_type("AdTextAsset")
-            mandatory.text = app_ad.mandatory_ad_text.text
-            new_app_ad.mandatory_ad_text = mandatory
-        if app_ad.app_deep_link.asset:
-            deep_link = client.get_type("AdAppDeepLinkAsset")
-            deep_link.asset = app_ad.app_deep_link.asset
-            new_app_ad.app_deep_link = deep_link
-
-        remove_operation = client.get_type("AdGroupAdOperation")
-        remove_operation.remove = ad_group_ad_service.ad_group_ad_path(
-            customer_id, ad_group_id, ad_id
-        )
-
-        # Remove first — app ad groups allow only one creative per ad group.
-        mutate_response = ad_group_ad_service.mutate_ad_group_ads(
-            customer_id=customer_id,
-            operations=[remove_operation, create_operation],
-        )
-        new_resource_name = mutate_response.results[1].resource_name
-        new_ad_id = new_resource_name.split("~")[-1]
-
-        updated_fields = []
-        if headlines:
-            updated_fields.append("ad.app_ad.headlines")
-        if descriptions:
-            updated_fields.append("ad.app_ad.descriptions")
-
-        logger.info(
-            "Replaced APP_AD via create-and-remove",
-            customer_id=customer_id,
-            ad_group_id=ad_group_id,
-            replaced_ad_id=ad_id,
-            new_ad_id=new_ad_id,
-        )
-
-        return {
-            "success": True,
-            "ad_id": new_ad_id,
-            "replaced_ad_id": ad_id,
-            "method": "create_and_replace",
-            "updated_fields": updated_fields,
-            "resource_name": new_resource_name,
-            "headlines_count": len(final_headlines[:5]),
-            "descriptions_count": len(final_descriptions[:5]),
-        }
-    
     async def update_ad(
         self,
         customer_id: str,
@@ -564,24 +431,37 @@ class AdTools:
                 content_mask = FieldMask()
 
                 if ad_type == "APP_AD":
-                    if not (headlines or descriptions):
-                        raise ValueError(
-                            "APP_AD only supports headline/description updates via create_and_replace"
-                        )
                     if final_urls or path1 is not None or path2 is not None:
                         raise ValueError("APP_AD does not support final_urls or display paths")
 
-                    replace_result = await self._replace_app_ad(
-                        client,
-                        customer_id,
-                        ad_group_id,
-                        ad_id,
-                        headlines=headlines,
-                        descriptions=descriptions,
+                    ad_operation = client.get_type("AdOperation")
+                    ad = ad_operation.update
+                    ad.resource_name = ad_service.ad_path(customer_id, ad_id)
+
+                    if headlines:
+                        ad.app_ad.headlines.clear()
+                        for headline in headlines[:5]:
+                            headline_asset = client.get_type("AdTextAsset")
+                            headline_asset.text = headline
+                            ad.app_ad.headlines.append(headline_asset)
+                        content_mask.paths.append("app_ad.headlines")
+                        updated_fields.append("app_ad.headlines")
+
+                    if descriptions:
+                        ad.app_ad.descriptions.clear()
+                        for description in descriptions[:5]:
+                            description_asset = client.get_type("AdTextAsset")
+                            description_asset.text = description
+                            ad.app_ad.descriptions.append(description_asset)
+                        content_mask.paths.append("app_ad.descriptions")
+                        updated_fields.append("app_ad.descriptions")
+
+                    ad_operation.update_mask = content_mask
+                    response = ad_service.mutate_ads(
+                        customer_id=customer_id,
+                        operations=[ad_operation],
                     )
-                    updated_fields.extend(replace_result["updated_fields"])
-                    results.append(replace_result["resource_name"])
-                    ad_id = replace_result["ad_id"]
+                    results.append(response.results[0].resource_name)
                 else:
                     ad_operation = client.get_type("AdOperation")
                     ad = ad_operation.update
